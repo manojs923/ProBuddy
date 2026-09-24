@@ -1,16 +1,33 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { createClient } from "@supabase/supabase-js";
+import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { Copy, Send, RefreshCw, Layers } from "lucide-react";
 
-// Initialize Supabase
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
-const supabase = createClient(supabaseUrl, supabaseKey);
+// =====================================================================
+// MULTI-DB FALLBACK INITIALIZATION
+// =====================================================================
+const urlsEnv = process.env.NEXT_PUBLIC_SUPABASE_URLS || process.env.NEXT_PUBLIC_SUPABASE_URL || "";
+const keysEnv = process.env.NEXT_PUBLIC_SUPABASE_KEYS || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "";
+
+const supabaseUrls: string[] = urlsEnv.split(',').map((u) => u.trim()).filter((u) => u.length > 0);
+const supabaseKeys: string[] = keysEnv.split(',').map((k) => k.trim()).filter((k) => k.length > 0);
+
+const supabaseClients: SupabaseClient[] = [];
+
+supabaseUrls.forEach((url: string, index: number) => {
+  const key = supabaseKeys[index];
+  if (url && key) {
+    try {
+      supabaseClients.push(createClient(url, key));
+    } catch (err) {
+      console.error(`[⚠️ WARNING] Failed to initialize Dashboard DB client for ${url}:`, err);
+    }
+  }
+});
 
 interface SessionData {
-  id: number;
+  id: string; // Changed to string to support UUIDs if configured
   batch_id: string;
   image_url: string;
   created_at: string;
@@ -23,24 +40,37 @@ export default function FriendDashboard() {
   const [answer, setAnswer] = useState("");
   const [status, setStatus] = useState("AWAITING CONNECTION...");
 
-  // Fetch captures when connected
+  // Fetch captures concurrently from all active databases
   const fetchCaptures = async () => {
-    if (!sessionCode) return;
+    if (!sessionCode || supabaseClients.length === 0) return;
     
-    const { data, error } = await supabase
-      .from("copilot_sessions")
-      .select("*")
-      .eq("session_code", sessionCode)
-      .not("image_url", "is", null)
-      .order("created_at", { ascending: true });
+    let allData: SessionData[] = [];
 
-    if (error) {
-      setStatus("ERROR FETCHING DATA");
-      return;
-    }
+    // Query all database nodes simultaneously
+    await Promise.all(supabaseClients.map(async (client, index) => {
+      try {
+        const { data, error } = await client
+          .from("copilot_sessions")
+          .select("*")
+          .eq("session_code", sessionCode)
+          .not("image_url", "is", null);
+
+        if (error) {
+          console.warn(`[DB Node ${index}] Fetch warning:`, error);
+        }
+        if (data) {
+          allData = [...allData, ...data];
+        }
+      } catch (err) {
+        console.warn(`[DB Node ${index}] Fetch exception:`, err);
+      }
+    }));
+
+    // Sort combined data chronologically in case of mid-session failovers
+    allData.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
 
     // Group images by Batch ID so they don't mix
-    const grouped = data.reduce((acc: Record<string, SessionData[]>, curr) => {
+    const grouped = allData.reduce((acc: Record<string, SessionData[]>, curr) => {
       if (!acc[curr.batch_id]) acc[curr.batch_id] = [];
       acc[curr.batch_id].push(curr);
       return acc;
@@ -51,23 +81,27 @@ export default function FriendDashboard() {
   };
 
   useEffect(() => {
-    if (!isConnected) return;
+    if (!isConnected || supabaseClients.length === 0) return;
     
     fetchCaptures();
 
-    // Listen for new screenshots arriving in real-time
-    const channel = supabase
-      .channel(`copilot-session-${sessionCode}`)
-      .on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "copilot_sessions", filter: `session_code=eq.${sessionCode}` },
-        () => {
-          fetchCaptures();
-        }
-      )
-      .subscribe();
+    // Listen to all database nodes concurrently
+    const channels = supabaseClients.map((client, index) => {
+      return client
+        .channel(`copilot-session-${sessionCode}-${index}`)
+        .on(
+          "postgres_changes",
+          { event: "INSERT", schema: "public", table: "copilot_sessions", filter: `session_code=eq.${sessionCode}` },
+          () => {
+            fetchCaptures();
+          }
+        )
+        .subscribe();
+    });
 
-    return () => { supabase.removeChannel(channel); };
+    return () => { 
+      channels.forEach((channel, index) => supabaseClients[index].removeChannel(channel)); 
+    };
   }, [isConnected, sessionCode]);
 
 // 🛡️ FIXED CORS-SAFE STITCH & COPY FUNCTION
@@ -132,23 +166,39 @@ export default function FriendDashboard() {
     }
   };
 
-  // Send answer back to your Tauri app
+  // 🛡️ MULTI-DB FALLBACK SEND ENGINE
   const sendAnswer = async () => {
-    if (!answer.trim()) return;
+    if (!answer.trim() || supabaseClients.length === 0) return;
     setStatus("SENDING...");
 
-    const { error } = await supabase
-      .from("copilot_sessions")
-      .insert([
-        {
-          session_code: sessionCode,
-          batch_id: "reply_" + Date.now(),
-          answer_text: answer,
-        }
-      ]);
+    let uploadSuccess = false;
 
-    if (error) {
-      setStatus("FAILED TO SEND");
+    // Iterate through active DB clients until one succeeds
+    for (let i = 0; i < supabaseClients.length; i++) {
+      try {
+        const { error } = await supabaseClients[i]
+          .from("copilot_sessions")
+          .insert([
+            {
+              session_code: sessionCode,
+              batch_id: "reply_" + Date.now(),
+              answer_text: answer,
+            }
+          ]);
+
+        if (!error) {
+          uploadSuccess = true;
+          break; // Exit the fallback loop on success
+        } else {
+          console.warn(`[DB Node ${i}] Send error, routing to next node...`, error);
+        }
+      } catch (err) {
+        console.warn(`[DB Node ${i}] Exception caught, routing to next node...`, err);
+      }
+    }
+
+    if (!uploadSuccess) {
+      setStatus("FAILED TO SEND (ALL NODES OFFLINE)");
     } else {
       setStatus("ANSWER DELIVERED ✅");
       setAnswer("");
@@ -199,7 +249,7 @@ export default function FriendDashboard() {
               </div>
             )}
 
-            {Object.keys(batches).reverse().map((batchId, index) => (
+            {Object.keys(batches).reverse().map((batchId) => (
               <div key={batchId} className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
                 <div className="bg-slate-800/50 p-3 flex items-center justify-between border-b border-slate-800">
                   <span className="text-xs font-bold text-slate-400">BATCH: {batchId}</span>
@@ -250,4 +300,3 @@ export default function FriendDashboard() {
     </div>
   );
 }
-
