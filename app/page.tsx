@@ -6,6 +6,16 @@ import { Copy, Send, RefreshCw, Layers, MessageSquare, Check } from "lucide-reac
 
 const urlsEnv = process.env.NEXT_PUBLIC_SUPABASE_URLS || process.env.NEXT_PUBLIC_SUPABASE_URL || "";
 const keysEnv = process.env.NEXT_PUBLIC_SUPABASE_KEYS || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "";
+const provibeWebSocketUrl = process.env.NEXT_PUBLIC_PROVIBE_WS_URL || "wss://provibe.onrender.com";
+
+const isValidWebSocketUrl = (value: string): boolean => {
+  try {
+    const url = new URL(value);
+    return url.protocol === "ws:" || url.protocol === "wss:";
+  } catch {
+    return false;
+  }
+};
 
 const supabaseUrls: string[] = urlsEnv.split(',').map((u) => u.trim()).filter((u) => u.length > 0);
 const supabaseKeys: string[] = keysEnv.split(',').map((k) => k.trim()).filter((k) => k.length > 0);
@@ -75,9 +85,12 @@ export default function FriendDashboard() {
   const [answer, setAnswer] = useState("");
   const [chatDraft, setChatDraft] = useState("");
   const [status, setStatus] = useState("AWAITING CONNECTION...");
+  const [serverStatus, setServerStatus] = useState("DISCONNECTED");
+  const [serverMessage, setServerMessage] = useState("");
 
   const seenRef = useRef<Set<string>>(new Set());
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const serverSocketRef = useRef<WebSocket | null>(null);
   /** Highest frame created_at already pulled, so polls fetch new rows only. */
   const frameCursorRef = useRef<string>("");
   /** Node index that last accepted a write; sticks so a dead node is probed once. */
@@ -202,6 +215,7 @@ export default function FriendDashboard() {
       if (await checkClosed(code)) {
         setClosed(true);
         setStatus("SESSION COMPLETE");
+        setServerStatus("DISCONNECTED");
       }
     }, THREAD_POLL_MS);
 
@@ -227,6 +241,74 @@ export default function FriendDashboard() {
   }, [isConnected, closed, sessionCode]);
 
   useEffect(() => {
+    if (!isConnected || closed) return;
+    let disposed = false;
+    let connectionFailed = false;
+    const socket = new WebSocket(provibeWebSocketUrl);
+    serverSocketRef.current = socket;
+    socket.onopen = () => {
+      try {
+        socket.send(JSON.stringify({
+          action: "set_session",
+          session_code: sessionCode,
+          client_type: "browser",
+        }));
+        if (!disposed) {
+          setServerStatus("CONNECTED");
+          setServerMessage("Connected to the ProVibe server.");
+        }
+      } catch (error) {
+        connectionFailed = true;
+        console.error("Could not join the ProVibe session:", error);
+        if (!disposed) {
+          setServerStatus("CONNECTION ERROR");
+          setServerMessage("Connected to the server, but could not join this session.");
+        }
+      }
+    };
+    socket.onmessage = (event: MessageEvent<string>) => {
+      let message: { status?: unknown; data?: unknown; transcript?: unknown };
+      try {
+        message = JSON.parse(event.data);
+      } catch (error) {
+        console.error("Received an invalid message from the ProVibe server:", error);
+        if (!disposed) {
+          setServerStatus("INVALID RESPONSE");
+          setServerMessage("The ProVibe server returned an unreadable response.");
+        }
+        return;
+      }
+
+      if (!disposed && message.status === "error") {
+        setServerStatus("SERVER ERROR");
+        setServerMessage(typeof message.data === "string" ? message.data : "The ProVibe server rejected the request.");
+      } else if (!disposed && typeof message.transcript === "string") {
+        setServerMessage(message.transcript);
+      }
+    };
+    socket.onerror = () => {
+      connectionFailed = true;
+      if (!disposed) {
+        setServerStatus("CONNECTION ERROR");
+        setServerMessage("Could not reach the ProVibe server. Check that the Render service is available.");
+      }
+    };
+    socket.onclose = () => {
+      if (serverSocketRef.current === socket) serverSocketRef.current = null;
+      if (!disposed && !connectionFailed) {
+        setServerStatus("DISCONNECTED");
+        setServerMessage("The ProVibe server connection closed.");
+      }
+    };
+
+    return () => {
+      disposed = true;
+      if (serverSocketRef.current === socket) serverSocketRef.current = null;
+      socket.close();
+    };
+  }, [isConnected, closed, sessionCode]);
+
+  useEffect(() => {
     if (chatEndRef.current) chatEndRef.current.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [chatLines]);
 
@@ -235,6 +317,8 @@ export default function FriendDashboard() {
       setIsConnected(false);
       setBatches({});
       setChatLines([]);
+      setServerStatus("DISCONNECTED");
+      setServerMessage("");
       seenRef.current = new Set();
       frameCursorRef.current = "";
       setStatus("DISCONNECTED");
@@ -244,6 +328,13 @@ export default function FriendDashboard() {
         return;
       }
       setStatus("CONNECTING...");
+      if (!isValidWebSocketUrl(provibeWebSocketUrl)) {
+        setServerStatus("CONNECTION ERROR");
+        setServerMessage("The ProVibe WebSocket URL must use ws:// or wss://.");
+        return;
+      }
+      setServerStatus("CONNECTING");
+      setServerMessage("");
       setIsConnected(true);
     }
   };
@@ -259,6 +350,8 @@ export default function FriendDashboard() {
     activeNodeRef.current = 0;
     setSessionCode("");
     setIsConnected(false);
+    setServerStatus("DISCONNECTED");
+    setServerMessage("");
     setStatus("AWAITING CONNECTION...");
   };
 
@@ -319,6 +412,20 @@ export default function FriendDashboard() {
       answer_text: text,
     });
     if (!ok) setStatus("CHAT FAILED — ALL NODES");
+    else {
+      const socket = serverSocketRef.current;
+      if (socket?.readyState === WebSocket.OPEN) {
+        try {
+          socket.send(JSON.stringify({ action: "text_query", session_code: sessionCode, text }));
+          setStatus("CHAT SENT");
+        } catch (error) {
+          console.error("Could not send chat to the ProVibe server:", error);
+          setStatus("CHAT SAVED; SERVER SEND FAILED");
+        }
+      } else {
+        setStatus("CHAT SAVED; SERVER OFFLINE");
+      }
+    }
   };
 
   const sendAnswer = async () => {
@@ -367,6 +474,14 @@ export default function FriendDashboard() {
             }`}>
               {status}
             </span>
+            <span
+              title={serverMessage}
+              className={`text-xs font-bold px-3 py-1 rounded ${
+                serverStatus === "CONNECTED" ? "bg-emerald-900 text-emerald-400" : "bg-amber-900 text-amber-400"
+              }`}
+            >
+              SERVER {serverStatus}
+            </span>
             <input
               type="text"
               placeholder="ENTER 6-DIGIT CODE"
@@ -380,6 +495,12 @@ export default function FriendDashboard() {
             </button>
           </div>
         </div>
+
+        {serverMessage && (
+          <p role="status" className={`text-xs ${serverStatus === "CONNECTED" ? "text-slate-500" : "text-amber-400"}`}>
+            {serverMessage}
+          </p>
+        )}
 
         <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
 
