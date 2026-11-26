@@ -1,30 +1,34 @@
 # ProBuddy
 
-ProBuddy is a Next.js dashboard that joins the ProVibe WebSocket server at
-`wss://provibe.onrender.com` using the entered session code. Chat messages are
-stored in Supabase and also relayed to the ProVibe server when connected;
-Supabase remains the source for frames and chat history.
+ProBuddy is the Next.js web companion for authenticated Protocol sharing
+sessions. It joins the Render WebSocket at `wss://provibe.onrender.com` by
+default; override it with `NEXT_PUBLIC_WS_URL` if needed.
 
-The server URL can be overridden with `NEXT_PUBLIC_PROVIBE_WS_URL`. Set this
-variable before building because `NEXT_PUBLIC_` values are embedded in the
-client bundle at build time.
+## Local setup
 
-## Run locally
+Copy `.env.example` to `.env.local` and add the Supabase anon keys:
 
-```bash
+```powershell
 npm ci
 npm run dev
 ```
 
-## Deploy the frontend
+## Vercel deployment
 
-Deploy this Next.js app as a separate Node.js service:
+Set these variables in the Vercel project settings before building:
 
-- Build command: `npm ci && npm run build`
-- Start command: `npm start`
-- Environment variable: `NEXT_PUBLIC_PROVIBE_WS_URL=wss://provibe.onrender.com`
+- `NEXT_PUBLIC_WS_URL` — `wss://provibe.onrender.com`
+- `NEXT_PUBLIC_SUPABASE_URL` — Supabase project URL(s), comma-separated only if
+  configuring multiple independent projects
+- `NEXT_PUBLIC_SUPABASE_ANON_KEY` — matching public anon key(s), in the same
+  order as the URLs
 
-Keep the existing Python Render service configured with
-`python backend/ai_engine/server.py`; it hosts the WebSocket server, not this
-Next.js frontend. If that service sets `ALLOWED_ORIGINS`, include the
-frontend's origin.
+The `NEXT_PUBLIC_` values are part of the browser bundle, so never put a
+service-role key in them. The Render backend separately needs `SUPABASE_URLS`,
+`SUPABASE_KEYS`, and `ALLOWED_ORIGINS`.
+
+Multiple Supabase URLs are independent projects, not a replicated cluster.
+The desktop host and browser viewer must sign in to the same Supabase account
+on the same project.
+Chat history and private screen-frame history are stored in that project;
+current frames are also relayed live over the authenticated WebSocket.
